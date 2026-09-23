@@ -1,0 +1,1528 @@
+{
+  "name": "Ticket-Recommendation-Reply-Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "authentication": "airtableOAuth2Api",
+        "baseId": {
+          "__rl": true,
+          "value": "appZBVhoYYvBObghp",
+          "mode": "id"
+        },
+        "tableId": {
+          "__rl": true,
+          "value": "tblrciUVr3Oma3vmg",
+          "mode": "id"
+        },
+        "triggerField": "Created at",
+        "additionalFields": {
+          "viewId": "viwsyDp4C3IcmNbs2"
+        }
+      },
+      "type": "n8n-nodes-base.airtableTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "df417181-ce9e-477e-b613-89eb07a91f32",
+      "name": "Airtable Trigger",
+      "credentials": {
+        "airtableOAuth2Api": {
+          "id": "nF4AvZQ5FGbCuNwg",
+          "name": "Airtable account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-opus-4-6",
+          "mode": "list",
+          "cachedResultName": "claude-opus-4-6"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a support triage assistant for Halcyon Health, a private healthcare provider delivering ADHD assessments, titration, and ongoing prescribing support, working alongside patients' GPs under Shared Care agreements. Read the message and return ONLY a JSON object with these keys:\n\nprimary_category: exactly one of: medication_supply_issue, titration_dose_query, safeguarding_concern, clinical_deterioration_report, appointment_scheduling, assessment_status_enquiry, shared_care_gp_coordination, complaint_service_dispute, billing_payment_issue, new_patient_sales_enquiry, general_information_request\n\nrisk_signals: an array containing zero or more of: controlled_medication_gap, self_directed_dose_change, adverse_physical_symptom, third_party_welfare_concern, clinician_conduct_concern, regulatory_threat, repeat_unresolved_contact, consent_dispute. Return an empty array [] if none apply. A risk signal can exist even when the category looks routine — for example, a message primarily about rescheduling an appointment still needs controlled_medication_gap flagged if it also mentions running out of medication. self_directed_dose_change applies only when the patient describes having already changed their own dosing, not when they are simply asking a question about it.\n\nconfidence: high, medium, or low — your genuine confidence in the primary_category, not in the reply.\n\nurgency: low, medium, or high.\n\nsentiment: a brief factual phrase describing the sender's stated concern, not their emotional tone.\n\nreasoning: one short sentence citing the specific phrase that drove your classification.\n\nsuggested_reply: a warm, professional, ready-to-send reply. Do not use em-dashes. Do not state specific facts you don't have (exact refund amounts, exact appointment dates, prescription timelines) — confirm what you'll check or who will follow up instead. Never make or imply a clinical or dosing decision in the reply, regardless of category — always direct dosing questions to the clinical team.\n\nDo not include an \"action\" field — that is decided separately, not by you.\n\nReturn ONLY the JSON object, no other text. Message:\n{{ $json.fields.Message }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        224,
+        0
+      ],
+      "id": "30d76406-8743-442b-ac27-366605ab3638",
+      "name": "Message a model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "QFIiOLzpkGVzYt9W",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = String($input.item.json.content?.[0]?.text ?? '');\nconst match = raw.match(/\\{[\\s\\S]*\\}/);\nconst cleaned = match ? match[0] : raw.trim();\n\nconst ALLOWED_CATEGORIES = [\n  \"medication_supply_issue\", \"titration_dose_query\", \"safeguarding_concern\",\n  \"clinical_deterioration_report\", \"appointment_scheduling\", \"assessment_status_enquiry\",\n  \"shared_care_gp_coordination\", \"complaint_service_dispute\", \"billing_payment_issue\",\n  \"new_patient_sales_enquiry\", \"general_information_request\"\n];\nconst ALWAYS_ESCALATE = [\n  \"titration_dose_query\", \"safeguarding_concern\",\n  \"clinical_deterioration_report\", \"complaint_service_dispute\"\n];\n\nlet parsed;\nlet parseError = false;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (error) {\n  parseError = true;\n  parsed = {};\n}\n\nconst categoryWasInvalid = !ALLOWED_CATEGORIES.includes(parsed.primary_category);\nconst category = categoryWasInvalid ? \"general_information_request\" : parsed.primary_category;\nconst riskSignals = Array.isArray(parsed.risk_signals) ? parsed.risk_signals : [];\nconst confidence = parsed.confidence ?? \"low\";\n\nlet action, decisionReason;\nif (parseError) {\n  action = \"escalate\"; decisionReason = \"LLM response could not be parsed as JSON\";\n} else if (categoryWasInvalid) {\n  action = \"escalate\"; decisionReason = \"Model returned a category outside the fixed taxonomy\";\n} else if (riskSignals.length > 0) {\n  action = \"escalate\"; decisionReason = `Risk signal(s) present: ${riskSignals.join(\", \")}`;\n} else if (ALWAYS_ESCALATE.includes(category)) {\n  action = \"escalate\"; decisionReason = `Category \"${category}\" always routes to human review`;\n} else if (confidence === \"low\") {\n  action = \"escalate\"; decisionReason = \"Model confidence was low\";\n} else {\n  action = \"auto_resolve\"; decisionReason = \"No risk signals, category not sensitive, confidence acceptable\";\n}\n\n// Airtable's single-select options use its own exact display strings.\n// Keep \"action\" lowercase for the Switch node's logic; use \"action_label\" for Airtable writes.\n// IMPORTANT: these two strings must match Airtable's option text EXACTLY —\n// including case, spacing, and hyphenation — or the write will be rejected.\nconst ACTION_LABELS = {\n  auto_resolve: \"Auto-resolve\",\n  escalate: \"Escalate\"\n};\nconst actionLabel = ACTION_LABELS[action];\n\n// Explicit reference to the trigger node — do not rely on these passing through automatically.\n// Airtable nests real columns under .fields; the record's own Airtable ID sits at the top level as .id.\nconst trigger = $('Airtable Trigger').item.json;\n\nconst noteText = `Ticket ${trigger.fields['Ticket ID']} — Halcyon Health Triage\nCategory: ${category}\nRisk signals: ${riskSignals.join(\", \") || \"none\"}\nConfidence: ${confidence}\nUrgency: ${parsed.urgency ?? \"medium\"}\nSentiment: ${parsed.sentiment ?? \"n/a\"}\nReasoning: ${parsed.reasoning ?? \"n/a\"}\nAction taken: ${action} (${decisionReason})\nSuggested reply: ${parsed.suggested_reply ?? \"n/a\"}`;\n\nreturn {\n  json: {\n    airtable_record_id: trigger.id,\n    ticket_id: trigger.fields['Ticket ID'],\n    sender_email: trigger.fields['Sender Email'],\n    original_message: trigger.fields['Message'],\n    primary_category: category,\n    risk_signals: riskSignals,\n    risk_signals_text: riskSignals.join(\", \"),\n    confidence,\n    urgency: parsed.urgency ?? \"medium\",\n    sentiment: parsed.sentiment ?? null,\n    reasoning: parsed.reasoning ?? null,\n    suggested_reply: parsed.suggested_reply ?? null,\n    action,\n    action_label: actionLabel,\n    decision_reason: decisionReason,\n    parse_error: parseError,\n    status: action === \"auto_resolve\" ? \"Auto-Resolved\" : \"Escalated\",\n    timestamp: new Date().toISOString(),\n    note_text: noteText\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        0
+      ],
+      "id": "a92df445-aef5-4cb9-8472-66926ad1376c",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.action}}",
+                    "rightValue": "auto_resolve",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "008d6168-43bd-42cc-a016-0400ecf76d1a"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "auto_resolve"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "fc2c7c34-760b-4e46-8ca9-a9e5b7d2c8ee",
+                    "leftValue": "={{$json.action}}",
+                    "rightValue": "escalate",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "escalate"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        880,
+        160
+      ],
+      "id": "94714684-7bd7-4c15-aea3-22e02db3aca7",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "operation": "sendAndWait",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C09APJX79PZ",
+          "mode": "list",
+          "cachedResultName": "all-harrys-slack"
+        },
+        "message": "=New Support Escalation\nCategory: {{ $json.primary_category }}\nRisk signal: {{ $json.risk_signals[0] }}\nUrgency: {{ $json.urgency }}\nConfidence: {{ $json.confidence }}\n\nSummary: {{ $json.reasoning }}\n\nSuggested Reply: {{ $json.suggested_reply }}",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double"
+          }
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1104,
+        320
+      ],
+      "id": "b6b873d0-78c9-458e-8b5e-7b780bd7185b",
+      "name": "Send message and wait for response",
+      "webhookId": "cbb5615e-b7d8-4865-b81c-8f91e8fe68e3",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "YthXGzHQ9GE7MgUT",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "airtableOAuth2Api",
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "value": "appZBVhoYYvBObghp",
+          "mode": "list",
+          "cachedResultName": "Halcyon Health",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblrciUVr3Oma3vmg",
+          "mode": "list",
+          "cachedResultName": "Imported table",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp/tblrciUVr3Oma3vmg"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.airtable_record_id }}",
+            "Ticket ID": "={{ $json.ticket_id }}",
+            "Primary Category": "={{ $json.primary_category }}",
+            "Risk Signals": "={{ $json.risk_signals_text }}",
+            "Confidence": "={{ $json.confidence }}",
+            "Urgency": "={{ $json.urgency }}",
+            "Sentiment": "={{ $json.sentiment }}",
+            "Reasoning": "={{ $json.reasoning }}",
+            "Suggested Reply": "={{ $json.suggested_reply }}",
+            "Action": "={{ $json.action_label }}",
+            "Decision Reason": "={{ $json.decision_reason }}",
+            "Status": "={{ $json.status }}",
+            "Date Triaged": "={{ $json.timestamp }}"
+          },
+          "matchingColumns": [
+            "id",
+            "Ticket ID"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": false
+            },
+            {
+              "id": "Ticket ID",
+              "displayName": "Ticket ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Created at",
+              "displayName": "Created at",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": true
+            },
+            {
+              "id": "Sender Email",
+              "displayName": "Sender Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Message",
+              "displayName": "Message",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Primary Category",
+              "displayName": "Primary Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "medication_supply_issue",
+                  "value": "medication_supply_issue"
+                },
+                {
+                  "name": "titration_dose_query",
+                  "value": "titration_dose_query"
+                },
+                {
+                  "name": "safeguarding_concern",
+                  "value": "safeguarding_concern"
+                },
+                {
+                  "name": "clinical_deterioration_report",
+                  "value": "clinical_deterioration_report"
+                },
+                {
+                  "name": "appointment_scheduling",
+                  "value": "appointment_scheduling"
+                },
+                {
+                  "name": "assessment_status_enquiry",
+                  "value": "assessment_status_enquiry"
+                },
+                {
+                  "name": "shared_care_gp_coordination",
+                  "value": "shared_care_gp_coordination"
+                },
+                {
+                  "name": "complaint_service_dispute",
+                  "value": "complaint_service_dispute"
+                },
+                {
+                  "name": "billing_payment_issue",
+                  "value": "billing_payment_issue"
+                },
+                {
+                  "name": "new_patient_sales_enquiry",
+                  "value": "new_patient_sales_enquiry"
+                },
+                {
+                  "name": "general_information_request",
+                  "value": "general_information_request"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Risk Signals",
+              "displayName": "Risk Signals",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "controlled_medication_gap",
+                  "value": "controlled_medication_gap"
+                },
+                {
+                  "name": "self-directed_dose_change",
+                  "value": "self-directed_dose_change"
+                },
+                {
+                  "name": "adverse_physical_symptom",
+                  "value": "adverse_physical_symptom"
+                },
+                {
+                  "name": "third_party_welfare_concern",
+                  "value": "third_party_welfare_concern"
+                },
+                {
+                  "name": "clinician_conduct_concern",
+                  "value": "clinician_conduct_concern"
+                },
+                {
+                  "name": "regulatory_threat",
+                  "value": "regulatory_threat"
+                },
+                {
+                  "name": "repeat_unresolved_contact",
+                  "value": "repeat_unresolved_contact"
+                },
+                {
+                  "name": "consent_dispute",
+                  "value": "consent_dispute"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Confidence",
+              "displayName": "Confidence",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "low",
+                  "value": "low"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sentiment",
+              "displayName": "Sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reasoning",
+              "displayName": "Reasoning",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Suggested Reply",
+              "displayName": "Suggested Reply",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Action",
+              "displayName": "Action",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Auto-resolve",
+                  "value": "Auto-resolve"
+                },
+                {
+                  "name": "Escalate",
+                  "value": "Escalate"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Decision Reason",
+              "displayName": "Decision Reason",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Escalated",
+                  "value": "Escalated"
+                },
+                {
+                  "name": "Auto-Resolved",
+                  "value": "Auto-Resolved"
+                },
+                {
+                  "name": "Solved",
+                  "value": "Solved"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Date Triaged",
+              "displayName": "Date Triaged",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        864,
+        -192
+      ],
+      "id": "ad771166-b4dc-4d61-b391-2f0c4e642265",
+      "name": "Update ticket in Airtable",
+      "credentials": {
+        "airtableOAuth2Api": {
+          "id": "nF4AvZQ5FGbCuNwg",
+          "name": "Airtable account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/batch/upsert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer pat-eu1-12593cb8-d9eb-4bb0-a71c-bf5ffc7ecba7"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"inputs\": [\n    {\n      \"id\": \"{{$json.sender_email}}\",\n      \"idProperty\": \"email\",\n      \"properties\": {\n        \"last_triage_category\": \"{{$json.primary_category}}\",\n        \"last_triage_urgency\": \"{{$json.urgency}}\"\n      }\n    }\n  ]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        864,
+        -32
+      ],
+      "id": "2858aa54-d562-4900-a60f-6b1d966f5b9c",
+      "name": "Hubspot - Contact Update with ticket details"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/notes",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer pat-eu1-12593cb8-d9eb-4bb0-a71c-bf5ffc7ecba7"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"properties\": {\n    \"hs_timestamp\": \"{{Date.now()}}\",\n    \"hs_note_body\": {{JSON.stringify($('Code in JavaScript').item.json.note_text)}}\n  },\n  \"associations\": [\n    {\n      \"to\": { \"id\": \"{{$json.results[0].id}}\" },\n      \"types\": [\n        { \"associationCategory\": \"HUBSPOT_DEFINED\", \"associationTypeId\": 202 }\n      ]\n    }\n  ]\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1072,
+        -32
+      ],
+      "id": "c27b4eed-f975-4540-ba69-8fce26619a72",
+      "name": "Hubspot Note Update with ticket details"
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Code in JavaScript').item.json.sender_email }}",
+        "subject": "Re: your message to Halcyon Health",
+        "message": "={{ $('Code in JavaScript').item.json.suggested_reply }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1296,
+        320
+      ],
+      "id": "75ee04ef-c863-4b37-b842-6c7aa65bcc94",
+      "name": "Email Sent once confirmed",
+      "webhookId": "743af873-8c00-410a-8404-0379d282fb66",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "ktpde1tSoYm0ekWt",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Code in JavaScript').item.json.sender_email }}",
+        "subject": "Re: your message to Halcyon Health",
+        "message": "={{ $('Code in JavaScript').item.json.suggested_reply }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1296,
+        144
+      ],
+      "id": "62b3a4ba-5ea9-4722-b09d-15a6f5fdc212",
+      "name": "Auto-resolve email sent",
+      "webhookId": "2fbc23b9-e490-43a6-b23d-ef4792674487",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "ktpde1tSoYm0ekWt",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "airtableOAuth2Api",
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "value": "appZBVhoYYvBObghp",
+          "mode": "list",
+          "cachedResultName": "Halcyon Health",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblrciUVr3Oma3vmg",
+          "mode": "list",
+          "cachedResultName": "Imported table",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp/tblrciUVr3Oma3vmg"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.airtable_record_id }}",
+            "Ticket ID": "={{ $json.ticket_id }}",
+            "Primary Category": "={{ $json.primary_category }}",
+            "Risk Signals": "={{ $json.risk_signals_text }}",
+            "Confidence": "={{ $json.confidence }}",
+            "Urgency": "={{ $json.urgency }}",
+            "Sentiment": "={{ $json.sentiment }}",
+            "Reasoning": "={{ $json.reasoning }}",
+            "Suggested Reply": "={{ $json.suggested_reply }}",
+            "Action": "={{ $json.action_label }}",
+            "Decision Reason": "={{ $json.decision_reason }}",
+            "Status": "={{ $json.status }}",
+            "Date Triaged": "={{ $json.timestamp }}"
+          },
+          "matchingColumns": [
+            "id",
+            "Ticket ID"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": false
+            },
+            {
+              "id": "Ticket ID",
+              "displayName": "Ticket ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Created at",
+              "displayName": "Created at",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": true
+            },
+            {
+              "id": "Sender Email",
+              "displayName": "Sender Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Message",
+              "displayName": "Message",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Primary Category",
+              "displayName": "Primary Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "medication_supply_issue",
+                  "value": "medication_supply_issue"
+                },
+                {
+                  "name": "titration_dose_query",
+                  "value": "titration_dose_query"
+                },
+                {
+                  "name": "safeguarding_concern",
+                  "value": "safeguarding_concern"
+                },
+                {
+                  "name": "clinical_deterioration_report",
+                  "value": "clinical_deterioration_report"
+                },
+                {
+                  "name": "appointment_scheduling",
+                  "value": "appointment_scheduling"
+                },
+                {
+                  "name": "assessment_status_enquiry",
+                  "value": "assessment_status_enquiry"
+                },
+                {
+                  "name": "shared_care_gp_coordination",
+                  "value": "shared_care_gp_coordination"
+                },
+                {
+                  "name": "complaint_service_dispute",
+                  "value": "complaint_service_dispute"
+                },
+                {
+                  "name": "billing_payment_issue",
+                  "value": "billing_payment_issue"
+                },
+                {
+                  "name": "new_patient_sales_enquiry",
+                  "value": "new_patient_sales_enquiry"
+                },
+                {
+                  "name": "general_information_request",
+                  "value": "general_information_request"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Risk Signals",
+              "displayName": "Risk Signals",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "controlled_medication_gap",
+                  "value": "controlled_medication_gap"
+                },
+                {
+                  "name": "self-directed_dose_change",
+                  "value": "self-directed_dose_change"
+                },
+                {
+                  "name": "adverse_physical_symptom",
+                  "value": "adverse_physical_symptom"
+                },
+                {
+                  "name": "third_party_welfare_concern",
+                  "value": "third_party_welfare_concern"
+                },
+                {
+                  "name": "clinician_conduct_concern",
+                  "value": "clinician_conduct_concern"
+                },
+                {
+                  "name": "regulatory_threat",
+                  "value": "regulatory_threat"
+                },
+                {
+                  "name": "repeat_unresolved_contact",
+                  "value": "repeat_unresolved_contact"
+                },
+                {
+                  "name": "consent_dispute",
+                  "value": "consent_dispute"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Confidence",
+              "displayName": "Confidence",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "low",
+                  "value": "low"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sentiment",
+              "displayName": "Sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reasoning",
+              "displayName": "Reasoning",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Suggested Reply",
+              "displayName": "Suggested Reply",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Action",
+              "displayName": "Action",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Auto-resolve",
+                  "value": "Auto-resolve"
+                },
+                {
+                  "name": "Escalate",
+                  "value": "Escalate"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Decision Reason",
+              "displayName": "Decision Reason",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Escalated",
+                  "value": "Escalated"
+                },
+                {
+                  "name": "Auto-Resolved",
+                  "value": "Auto-Resolved"
+                },
+                {
+                  "name": "Solved",
+                  "value": "Solved"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Date Triaged",
+              "displayName": "Date Triaged",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        1552,
+        144
+      ],
+      "id": "194b6f45-abe4-47d8-9434-fb97c66bc577",
+      "name": "Update ticket in Airtable1",
+      "credentials": {
+        "airtableOAuth2Api": {
+          "id": "nF4AvZQ5FGbCuNwg",
+          "name": "Airtable account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "airtableOAuth2Api",
+        "operation": "update",
+        "base": {
+          "__rl": true,
+          "value": "appZBVhoYYvBObghp",
+          "mode": "list",
+          "cachedResultName": "Halcyon Health",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblrciUVr3Oma3vmg",
+          "mode": "list",
+          "cachedResultName": "Imported table",
+          "cachedResultUrl": "https://airtable.com/appZBVhoYYvBObghp/tblrciUVr3Oma3vmg"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $('Switch').item.json.airtable_record_id }}",
+            "Ticket ID": "={{ $('Switch').item.json.ticket_id }}",
+            "Primary Category": "={{ $('Switch').item.json.primary_category }}",
+            "Risk Signals": "={{ $('Switch').item.json.risk_signals[0] }}",
+            "Confidence": "={{ $('Switch').item.json.confidence }}",
+            "Urgency": "={{ $('Switch').item.json.urgency }}",
+            "Sentiment": "={{ $('Switch').item.json.sentiment }}",
+            "Reasoning": "={{ $('Switch').item.json.reasoning }}",
+            "Suggested Reply": "={{ $('Switch').item.json.suggested_reply }}",
+            "Action": "={{ $('Switch').item.json.action_label }}",
+            "Decision Reason": "={{ $('Switch').item.json.decision_reason }}",
+            "Status": "={{ $('Switch').item.json.status }}",
+            "Date Triaged": "={{ $('Switch').item.json.timestamp }}"
+          },
+          "matchingColumns": [
+            "id",
+            "Ticket ID"
+          ],
+          "schema": [
+            {
+              "id": "id",
+              "displayName": "id",
+              "required": false,
+              "defaultMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": false
+            },
+            {
+              "id": "Ticket ID",
+              "displayName": "Ticket ID",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Created at",
+              "displayName": "Created at",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": true,
+              "removed": true
+            },
+            {
+              "id": "Sender Email",
+              "displayName": "Sender Email",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Message",
+              "displayName": "Message",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Primary Category",
+              "displayName": "Primary Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "medication_supply_issue",
+                  "value": "medication_supply_issue"
+                },
+                {
+                  "name": "titration_dose_query",
+                  "value": "titration_dose_query"
+                },
+                {
+                  "name": "safeguarding_concern",
+                  "value": "safeguarding_concern"
+                },
+                {
+                  "name": "clinical_deterioration_report",
+                  "value": "clinical_deterioration_report"
+                },
+                {
+                  "name": "appointment_scheduling",
+                  "value": "appointment_scheduling"
+                },
+                {
+                  "name": "assessment_status_enquiry",
+                  "value": "assessment_status_enquiry"
+                },
+                {
+                  "name": "shared_care_gp_coordination",
+                  "value": "shared_care_gp_coordination"
+                },
+                {
+                  "name": "complaint_service_dispute",
+                  "value": "complaint_service_dispute"
+                },
+                {
+                  "name": "billing_payment_issue",
+                  "value": "billing_payment_issue"
+                },
+                {
+                  "name": "new_patient_sales_enquiry",
+                  "value": "new_patient_sales_enquiry"
+                },
+                {
+                  "name": "general_information_request",
+                  "value": "general_information_request"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Risk Signals",
+              "displayName": "Risk Signals",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "controlled_medication_gap",
+                  "value": "controlled_medication_gap"
+                },
+                {
+                  "name": "self-directed_dose_change",
+                  "value": "self-directed_dose_change"
+                },
+                {
+                  "name": "adverse_physical_symptom",
+                  "value": "adverse_physical_symptom"
+                },
+                {
+                  "name": "third_party_welfare_concern",
+                  "value": "third_party_welfare_concern"
+                },
+                {
+                  "name": "clinician_conduct_concern",
+                  "value": "clinician_conduct_concern"
+                },
+                {
+                  "name": "regulatory_threat",
+                  "value": "regulatory_threat"
+                },
+                {
+                  "name": "repeat_unresolved_contact",
+                  "value": "repeat_unresolved_contact"
+                },
+                {
+                  "name": "consent_dispute",
+                  "value": "consent_dispute"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Confidence",
+              "displayName": "Confidence",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "high",
+                  "value": "high"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "low",
+                  "value": "low"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Urgency",
+              "displayName": "Urgency",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "low",
+                  "value": "low"
+                },
+                {
+                  "name": "medium",
+                  "value": "medium"
+                },
+                {
+                  "name": "high",
+                  "value": "high"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Sentiment",
+              "displayName": "Sentiment",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reasoning",
+              "displayName": "Reasoning",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Suggested Reply",
+              "displayName": "Suggested Reply",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Action",
+              "displayName": "Action",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "Auto-resolve",
+                  "value": "Auto-resolve"
+                },
+                {
+                  "name": "Escalate",
+                  "value": "Escalate"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Decision Reason",
+              "displayName": "Decision Reason",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "options",
+              "options": [
+                {
+                  "name": "New",
+                  "value": "New"
+                },
+                {
+                  "name": "Escalated",
+                  "value": "Escalated"
+                },
+                {
+                  "name": "Auto-Resolved",
+                  "value": "Auto-Resolved"
+                },
+                {
+                  "name": "Solved",
+                  "value": "Solved"
+                }
+              ],
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Date Triaged",
+              "displayName": "Date Triaged",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.2,
+      "position": [
+        1552,
+        320
+      ],
+      "id": "fec29363-f539-432e-ab22-3bd06047921e",
+      "name": "Update ticket in Airtable2",
+      "credentials": {
+        "airtableOAuth2Api": {
+          "id": "nF4AvZQ5FGbCuNwg",
+          "name": "Airtable account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Airtable Trigger": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Update ticket in Airtable",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Hubspot - Contact Update with ticket details",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Auto-resolve email sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send message and wait for response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send message and wait for response": {
+      "main": [
+        [
+          {
+            "node": "Email Sent once confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hubspot - Contact Update with ticket details": {
+      "main": [
+        [
+          {
+            "node": "Hubspot Note Update with ticket details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Sent once confirmed": {
+      "main": [
+        [
+          {
+            "node": "Update ticket in Airtable2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-resolve email sent": {
+      "main": [
+        [
+          {
+            "node": "Update ticket in Airtable1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0bb6043e-3310-46cb-905b-89feb5de08f7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "2a7885fdad087db07e5887264b9e82451d2aebffdcaea133b72b086e4faa0c15"
+  },
+  "nodeGroups": [],
+  "id": "hYR9yg6TXYMfSSXI",
+  "tags": []
+}
